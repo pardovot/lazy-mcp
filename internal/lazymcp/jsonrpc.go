@@ -16,11 +16,22 @@ type Message struct {
 }
 
 type RPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Code    int              `json:"code"`
+	Message string           `json:"message"`
+	Data    *json.RawMessage `json:"data,omitempty"`
+}
+
+// DiscoverMethod is the probe a client sends before initialize. Servers that
+// don't support it answer with an error, so its whole response is cached.
+const DiscoverMethod = "server/discover"
+
+type responseBody struct {
+	Result *json.RawMessage `json:"result,omitempty"`
+	Error  *RPCError        `json:"error,omitempty"`
 }
 
 var discoveryMethods = map[string]bool{
+	DiscoverMethod:              true,
 	"initialize":                true,
 	"notifications/initialized": true,
 	"tools/list":                true,
@@ -68,6 +79,27 @@ func MakeResponse(id any, result json.RawMessage) []byte {
 		JSONRPC: "2.0",
 		ID:      &rawID,
 		Result:  &result,
+	}
+	return SerializeMessage(&msg)
+}
+
+// ResponseBody returns the result or error of resp without the envelope.
+func ResponseBody(resp *Message) json.RawMessage {
+	data, _ := json.Marshal(responseBody{Result: resp.Result, Error: resp.Error})
+	return data
+}
+
+// MakeResponseFromBody builds a response from a body returned by ResponseBody.
+func MakeResponseFromBody(id any, body json.RawMessage) []byte {
+	var b responseBody
+	json.Unmarshal(body, &b)
+	idBytes, _ := json.Marshal(id)
+	rawID := json.RawMessage(idBytes)
+	msg := Message{
+		JSONRPC: "2.0",
+		ID:      &rawID,
+		Result:  b.Result,
+		Error:   b.Error,
 	}
 	return SerializeMessage(&msg)
 }

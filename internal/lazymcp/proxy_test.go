@@ -598,8 +598,8 @@ func TestInProcess_GoLiveWithNotification(t *testing.T) {
 
 	cache := NewCache([]string{"nonexistent-command-xyz"})
 	partialCache := map[string]json.RawMessage{
-		"initialize":  json.RawMessage(`{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"0.1.0"}}`),
-		"tools/list":  json.RawMessage(`{"tools":[]}`),
+		"initialize":   json.RawMessage(`{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"0.1.0"}}`),
+		"tools/list":   json.RawMessage(`{"tools":[]}`),
 		"prompts/list": json.RawMessage(`{"prompts":[]}`),
 	}
 	if err := cache.Save(partialCache); err != nil {
@@ -1000,5 +1000,175 @@ func TestInProcess_InvalidMessagesSkippedInCachedMode(t *testing.T) {
 
 	if len(responses) != 2 {
 		t.Fatalf("got %d responses, want 2", len(responses))
+	}
+}
+
+const discoverParams = `{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`
+
+func discoverProbeSession(idBase int) []string {
+	return []string{
+		request(fmt.Sprintf("probe-%d", idBase), "server/discover", discoverParams),
+		request(idBase, "initialize", initParams),
+		notification("notifications/initialized"),
+		request(idBase+1, "tools/list"),
+		request(idBase+2, "prompts/list"),
+		request(idBase+3, "resources/list"),
+	}
+}
+
+func TestInProcess_DiscoverProbeServedFromCache(t *testing.T) {
+	serverBin := buildMockServer(t)
+	cacheDir := t.TempDir()
+
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, discoverProbeSession(1)); err != nil {
+		t.Fatalf("first run error: %v", err)
+	}
+
+	cached := NewCache([]string{serverBin}).Load()
+	for _, key := range []string{"server/discover", "initialize", "tools/list", "prompts/list", "resources/list"} {
+		if _, ok := cached[key]; !ok {
+			t.Fatalf("cache should contain %s, got %v", key, cached)
+		}
+	}
+
+	// Without the server binary, any attempt to start it would produce error responses.
+	if err := os.Remove(serverBin); err != nil {
+		t.Fatal(err)
+	}
+
+	responses, err := runProxyInProcess(t, serverBin, cacheDir, discoverProbeSession(10))
+	if err != nil {
+		t.Fatalf("second run error: %v", err)
+	}
+	if len(responses) != 5 {
+		t.Fatalf("got %d responses, want 5: %v", len(responses), responses)
+	}
+
+	probe := responses[0]
+	if probe["id"] != "probe-10" {
+		t.Fatalf("probe response id: got %v, want probe-10", probe["id"])
+	}
+	probeErr, ok := probe["error"].(map[string]any)
+	if !ok || probeErr["code"] != float64(-32601) {
+		t.Fatalf("probe response should replay the cached -32601 error, got %v", probe)
+	}
+	if _, ok := probe["result"]; ok {
+		t.Fatalf("probe response should not have a result, got %v", probe)
+	}
+
+	for i, resp := range responses[1:] {
+		wantID := fmt.Sprintf("%d", 10+i)
+		if fmt.Sprintf("%v", resp["id"]) != wantID {
+			t.Fatalf("response %d id: got %v, want %s", i+1, resp["id"], wantID)
+		}
+		if resp["result"] == nil {
+			t.Fatalf("response %d should come from cache, got %v", i+1, resp)
+		}
+	}
+}
+
+func TestInProcess_GoLiveReplaysDiscoverProbe(t *testing.T) {
+	serverBin := buildMockServer(t)
+	cacheDir := t.TempDir()
+
+	// Cache built by a client that doesn't send the probe.
+	messages := []string{
+		request(1, "initialize", initParams),
+		notification("notifications/initialized"),
+		request(2, "tools/list"),
+	}
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, messages); err != nil {
+		t.Fatalf("first run error: %v", err)
+	}
+
+	messages = append(discoverProbeSession(10),
+		request(5, "tools/call", `{"name":"echo","arguments":{"text":"live"}}`))
+	responses, err := runProxyInProcess(t, serverBin, cacheDir, messages)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	found := false
+	for _, resp := range responses {
+		if fmt.Sprintf("%v", resp["id"]) == "5" {
+			text := resp["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"]
+			if text != "echo: live" {
+				t.Fatalf("got %q, want %q", text, "echo: live")
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("tools/call response not found")
+	}
+
+	cached := NewCache([]string{serverBin}).Load()
+	for _, key := range []string{"server/discover", "initialize", "tools/list"} {
+		if _, ok := cached[key]; !ok {
+			t.Fatalf("cache should contain %s after going live, got %v", key, cached)
+		}
+	}
+}
+
+func TestInProcess_GoLiveWithoutInitializeKeepsCache(t *testing.T) {
+	serverBin := buildMockServer(t)
+	cacheDir := t.TempDir()
+
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, discoverProbeSession(1)); err != nil {
+		t.Fatalf("first run error: %v", err)
+	}
+
+	messages := []string{
+		request(5, "tools/call", `{"name":"echo","arguments":{"text":"no-init"}}`),
+	}
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, messages); err != nil {
+		t.Fatalf("second run error: %v", err)
+	}
+
+	cached := NewCache([]string{serverBin}).Load()
+	for _, key := range []string{"server/discover", "initialize", "tools/list"} {
+		if _, ok := cached[key]; !ok {
+			t.Fatalf("cache should still contain %s, got %v", key, cached)
+		}
+	}
+}
+
+func TestInProcess_NoCacheNonDiscoveryFirstSavesNothing(t *testing.T) {
+	serverBin := buildMockServer(t)
+	cacheDir := t.TempDir()
+
+	messages := []string{
+		request(1, "tools/call", `{"name":"echo","arguments":{"text":"first"}}`),
+	}
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, messages); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	files, _ := filepath.Glob(filepath.Join(cacheDir, "*.json"))
+	if len(files) != 0 {
+		t.Fatalf("got %d cache files, want 0", len(files))
+	}
+}
+
+func TestInProcess_GoLiveWithoutProbeKeepsCachedProbe(t *testing.T) {
+	serverBin := buildMockServer(t)
+	cacheDir := t.TempDir()
+
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, discoverProbeSession(1)); err != nil {
+		t.Fatalf("first run error: %v", err)
+	}
+
+	messages := []string{
+		request(10, "initialize", initParams),
+		notification("notifications/initialized"),
+		request(11, "tools/call", `{"name":"echo","arguments":{"text":"no-probe"}}`),
+	}
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, messages); err != nil {
+		t.Fatalf("second run error: %v", err)
+	}
+
+	cached := NewCache([]string{serverBin}).Load()
+	if _, ok := cached["server/discover"]; !ok {
+		t.Fatalf("cache should still contain server/discover, got %v", cached)
 	}
 }

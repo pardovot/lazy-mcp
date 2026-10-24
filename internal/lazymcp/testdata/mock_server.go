@@ -80,8 +80,22 @@ func main() {
 					map[string]any{"type": "text", "text": fmt.Sprintf("echo: %s", params.Arguments.Text)},
 				},
 			})
+		default:
+			if msg.ID != nil {
+				respondError(msg.ID, -32601, fmt.Sprintf("Method %s not found", msg.Method))
+			}
 		}
 	}
+}
+
+func respondError(id *json.RawMessage, code int, message string) {
+	resp := map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"error":   map[string]any{"code": code, "message": message},
+	}
+	data, _ := json.Marshal(resp)
+	fmt.Fprintf(os.Stdout, "%s\n", data)
 }
 
 func respond(id *json.RawMessage, result any) {

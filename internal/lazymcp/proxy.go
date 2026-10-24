@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"sync"
@@ -16,6 +17,7 @@ type Proxy struct {
 	command          []string
 	cache            *Cache
 	cachedData       map[string]json.RawMessage
+	discoverParams   *json.RawMessage
 	initializeParams *json.RawMessage
 	cmd              *exec.Cmd
 	serverIn         io.WriteCloser
@@ -52,6 +54,14 @@ func (p *Proxy) runCached(scanner *bufio.Scanner) error {
 		}
 
 		switch {
+		case msg.Method == DiscoverMethod:
+			p.discoverParams = msg.Params
+			if body, ok := p.cachedData[DiscoverMethod]; ok {
+				p.writeStdout(MakeResponseFromBody(json.RawMessage(*msg.ID), body))
+			} else {
+				return p.goLive(msg, scanner)
+			}
+
 		case msg.Method == "initialize":
 			p.initializeParams = msg.Params
 			if result, ok := p.cachedData["initialize"]; ok {
@@ -97,6 +107,15 @@ func (p *Proxy) runNoCache(scanner *bufio.Scanner) error {
 		}
 
 		switch {
+		case msg.Method == DiscoverMethod:
+			p.discoverParams = msg.Params
+			resp, err := p.forwardRequest(msg)
+			if err != nil {
+				return err
+			}
+			newCache[DiscoverMethod] = ResponseBody(resp)
+			p.saveCache(newCache)
+
 		case msg.Method == "initialize":
 			p.initializeParams = msg.Params
 			resp, err := p.forwardRequest(msg)
@@ -141,7 +160,21 @@ func (p *Proxy) goLive(triggeringMsg *Message, scanner *bufio.Scanner) error {
 		return nil
 	}
 
-	newCache := make(map[string]json.RawMessage)
+	// Entries that can't be re-fetched below keep their cached values.
+	newCache := maps.Clone(p.cachedData)
+	if newCache == nil {
+		newCache = make(map[string]json.RawMessage)
+	}
+
+	if p.discoverParams != nil {
+		discoverReq := MakeRequest("lazy-mcp-discover", DiscoverMethod, p.discoverParams)
+		p.writeServer(SerializeMessage(discoverReq))
+		discoverResp, err := p.readResponse(`"lazy-mcp-discover"`)
+		if err != nil {
+			return err
+		}
+		newCache[DiscoverMethod] = ResponseBody(discoverResp)
+	}
 
 	if p.initializeParams != nil {
 		initReq := MakeRequest("lazy-mcp-init", "initialize", p.initializeParams)
@@ -245,6 +278,9 @@ func (p *Proxy) readResponse(requestID string) (*Message, error) {
 }
 
 func (p *Proxy) saveCache(data map[string]json.RawMessage) {
+	if len(data) == 0 {
+		return
+	}
 	p.cache.Save(data)
 }
 
