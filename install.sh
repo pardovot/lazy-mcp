@@ -13,9 +13,13 @@ URL="https://github.com/tkukushkin/lazy-mcp/releases/latest/download/lazy-mcp-${
 DEST="$HOME/.local/bin/lazy-mcp"
 
 mkdir -p "$HOME/.local/bin"
+TMP=$(mktemp "$HOME/.local/bin/.lazy-mcp.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+
 echo "Downloading lazy-mcp for ${OS}/${ARCH}..."
-curl -fsSL "$URL" -o "$DEST"
-chmod +x "$DEST"
+curl -fsSL "$URL" -o "$TMP"
+chmod 755 "$TMP"
+mv "$TMP" "$DEST"
 echo "Installed lazy-mcp to ${DEST}"
 
 case ":$PATH:" in
