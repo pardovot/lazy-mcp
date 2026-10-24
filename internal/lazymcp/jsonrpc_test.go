@@ -205,3 +205,23 @@ func TestParseMessageWhitespace(t *testing.T) {
 		t.Fatalf("got method %q, want %q", msg.Method, "test")
 	}
 }
+
+func TestMakeResponseFromBody(t *testing.T) {
+	data, ok := MakeResponseFromBody("x", json.RawMessage(`{"error":{"code":-32601,"message":"nope","data":{"a":1}}}`))
+	if !ok {
+		t.Fatal("body with error should be usable")
+	}
+	var msg Message
+	if err := json.Unmarshal(data, &msg); err != nil {
+		t.Fatal(err)
+	}
+	if string(*msg.ID) != `"x"` || msg.Error == nil || msg.Error.Code != -32601 || string(*msg.Error.Data) != `{"a":1}` {
+		t.Fatalf("unexpected response %s", data)
+	}
+
+	for _, body := range []string{`{}`, `garbage`, `null`} {
+		if _, ok := MakeResponseFromBody("x", json.RawMessage(body)); ok {
+			t.Fatalf("body %s should not be usable", body)
+		}
+	}
+}

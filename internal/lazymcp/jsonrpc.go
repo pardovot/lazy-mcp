@@ -21,8 +21,7 @@ type RPCError struct {
 	Data    *json.RawMessage `json:"data,omitempty"`
 }
 
-// DiscoverMethod is the probe a client sends before initialize. Servers that
-// don't support it answer with an error, so its whole response is cached.
+// DiscoverMethod is the probe a client sends before initialize.
 const DiscoverMethod = "server/discover"
 
 type responseBody struct {
@@ -90,9 +89,12 @@ func ResponseBody(resp *Message) json.RawMessage {
 }
 
 // MakeResponseFromBody builds a response from a body returned by ResponseBody.
-func MakeResponseFromBody(id any, body json.RawMessage) []byte {
+// It reports false when the body has neither a result nor an error.
+func MakeResponseFromBody(id any, body json.RawMessage) ([]byte, bool) {
 	var b responseBody
-	json.Unmarshal(body, &b)
+	if err := json.Unmarshal(body, &b); err != nil || (b.Result == nil && b.Error == nil) {
+		return nil, false
+	}
 	idBytes, _ := json.Marshal(id)
 	rawID := json.RawMessage(idBytes)
 	msg := Message{
@@ -101,7 +103,7 @@ func MakeResponseFromBody(id any, body json.RawMessage) []byte {
 		Result:  b.Result,
 		Error:   b.Error,
 	}
-	return SerializeMessage(&msg)
+	return SerializeMessage(&msg), true
 }
 
 func MakeErrorResponse(id any, code int, message string) []byte {

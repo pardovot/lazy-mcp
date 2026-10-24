@@ -17,7 +17,7 @@ type Proxy struct {
 	command          []string
 	cache            *Cache
 	cachedData       map[string]json.RawMessage
-	discoverParams   *json.RawMessage
+	discoverRequest  *Message
 	initializeParams *json.RawMessage
 	cmd              *exec.Cmd
 	serverIn         io.WriteCloser
@@ -54,10 +54,13 @@ func (p *Proxy) runCached(scanner *bufio.Scanner) error {
 		}
 
 		switch {
+		case msg.Method == DiscoverMethod && msg.ID == nil:
+			// swallow
+
 		case msg.Method == DiscoverMethod:
-			p.discoverParams = msg.Params
-			if body, ok := p.cachedData[DiscoverMethod]; ok {
-				p.writeStdout(MakeResponseFromBody(json.RawMessage(*msg.ID), body))
+			p.discoverRequest = msg
+			if resp, ok := MakeResponseFromBody(json.RawMessage(*msg.ID), p.cachedData[DiscoverMethod]); ok {
+				p.writeStdout(resp)
 			} else {
 				return p.goLive(msg, scanner)
 			}
@@ -107,8 +110,11 @@ func (p *Proxy) runNoCache(scanner *bufio.Scanner) error {
 		}
 
 		switch {
+		case msg.Method == DiscoverMethod && msg.ID == nil:
+			p.writeServer(SerializeMessage(msg))
+
 		case msg.Method == DiscoverMethod:
-			p.discoverParams = msg.Params
+			p.discoverRequest = msg
 			resp, err := p.forwardRequest(msg)
 			if err != nil {
 				return err
@@ -166,8 +172,8 @@ func (p *Proxy) goLive(triggeringMsg *Message, scanner *bufio.Scanner) error {
 		newCache = make(map[string]json.RawMessage)
 	}
 
-	if p.discoverParams != nil {
-		discoverReq := MakeRequest("lazy-mcp-discover", DiscoverMethod, p.discoverParams)
+	if p.discoverRequest != nil {
+		discoverReq := MakeRequest("lazy-mcp-discover", DiscoverMethod, p.discoverRequest.Params)
 		p.writeServer(SerializeMessage(discoverReq))
 		discoverResp, err := p.readResponse(`"lazy-mcp-discover"`)
 		if err != nil {
@@ -215,7 +221,18 @@ func (p *Proxy) goLive(triggeringMsg *Message, scanner *bufio.Scanner) error {
 
 	p.saveCache(newCache)
 
-	p.writeServer(SerializeMessage(triggeringMsg))
+	// A triggering probe is answered from its replay above instead of being sent again.
+	answered := false
+	if triggeringMsg == p.discoverRequest {
+		var resp []byte
+		resp, answered = MakeResponseFromBody(json.RawMessage(*triggeringMsg.ID), newCache[DiscoverMethod])
+		if answered {
+			p.writeStdout(resp)
+		}
+	}
+	if !answered {
+		p.writeServer(SerializeMessage(triggeringMsg))
+	}
 
 	return p.bidirectionalProxy(scanner)
 }

@@ -19,6 +19,7 @@ type message struct {
 func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
+	discoverCalls := 0
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -80,22 +81,32 @@ func main() {
 					map[string]any{"type": "text", "text": fmt.Sprintf("echo: %s", params.Arguments.Text)},
 				},
 			})
+		case "server/discover":
+			discoverCalls++
+			if msg.ID != nil {
+				respondError(msg.ID, -32601, "Method server/discover not found",
+					map[string]any{"discoverCalls": discoverCalls})
+			}
 		default:
 			if msg.ID != nil {
-				respondError(msg.ID, -32601, fmt.Sprintf("Method %s not found", msg.Method))
+				respondError(msg.ID, -32601, fmt.Sprintf("Method %s not found", msg.Method), nil)
 			}
 		}
 	}
 }
 
-func respondError(id *json.RawMessage, code int, message string) {
+func respondError(id *json.RawMessage, code int, message string, data any) {
+	rpcErr := map[string]any{"code": code, "message": message}
+	if data != nil {
+		rpcErr["data"] = data
+	}
 	resp := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
-		"error":   map[string]any{"code": code, "message": message},
+		"error":   rpcErr,
 	}
-	data, _ := json.Marshal(resp)
-	fmt.Fprintf(os.Stdout, "%s\n", data)
+	out, _ := json.Marshal(resp)
+	fmt.Fprintf(os.Stdout, "%s\n", out)
 }
 
 func respond(id *json.RawMessage, result any) {
