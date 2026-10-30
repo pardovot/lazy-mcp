@@ -13,6 +13,9 @@ import (
 
 const maxMessageSize = 10 << 20 // 10MB
 
+// Scanner buffers start small and grow up to maxMessageSize, so an idle proxy stays light.
+const initialBufferSize = 64 << 10 // 64KB
+
 type Proxy struct {
 	command          []string
 	cache            *Cache
@@ -41,7 +44,7 @@ func NewProxy(command []string, cache *Cache, stdin io.Reader, stdout io.Writer)
 
 func (p *Proxy) Run() error {
 	scanner := bufio.NewScanner(p.stdin)
-	scanner.Buffer(make([]byte, maxMessageSize), maxMessageSize)
+	scanner.Buffer(make([]byte, initialBufferSize), maxMessageSize)
 
 	if p.cachedData == nil {
 		return p.runNoCache(scanner)
@@ -297,7 +300,7 @@ func (p *Proxy) startServer() error {
 	}
 	p.cmd.Stderr = os.Stderr
 	p.serverOut = bufio.NewScanner(stdout)
-	p.serverOut.Buffer(make([]byte, maxMessageSize), maxMessageSize)
+	p.serverOut.Buffer(make([]byte, initialBufferSize), maxMessageSize)
 
 	if err := p.cmd.Start(); err != nil {
 		p.cmd = nil
