@@ -24,6 +24,14 @@ type RPCError struct {
 // DiscoverMethod is the probe a client sends before initialize.
 const DiscoverMethod = "server/discover"
 
+// ListenMethod opens the long-lived stream for list-changed notifications.
+// The server accepts it with ListenAckMethod and only responds when the stream closes.
+const ListenMethod = "subscriptions/listen"
+
+const ListenAckMethod = "notifications/subscriptions/acknowledged"
+
+const subscriptionIDKey = "io.modelcontextprotocol/subscriptionId"
+
 type responseBody struct {
 	Result *json.RawMessage `json:"result,omitempty"`
 	Error  *RPCError        `json:"error,omitempty"`
@@ -106,6 +114,29 @@ func MakeResponseFromBody(id any, body json.RawMessage) ([]byte, bool) {
 	return SerializeMessage(&msg), true
 }
 
+// MakeListenAck rebuilds cached acknowledgement params for the listen request with the given id.
+// It reports false when params are missing or malformed.
+func MakeListenAck(id json.RawMessage, params json.RawMessage) ([]byte, bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(params, &fields); err != nil || fields == nil {
+		return nil, false
+	}
+	var meta map[string]json.RawMessage
+	if raw, ok := fields["_meta"]; ok {
+		if err := json.Unmarshal(raw, &meta); err != nil {
+			return nil, false
+		}
+	}
+	if meta == nil {
+		meta = make(map[string]json.RawMessage)
+	}
+	meta[subscriptionIDKey] = id
+	fields["_meta"], _ = json.Marshal(meta)
+	paramBytes, _ := json.Marshal(fields)
+	rawParams := json.RawMessage(paramBytes)
+	return SerializeMessage(&Message{JSONRPC: "2.0", Method: ListenAckMethod, Params: &rawParams}), true
+}
+
 func MakeErrorResponse(id any, code int, message string) []byte {
 	idBytes, _ := json.Marshal(id)
 	rawID := json.RawMessage(idBytes)
@@ -123,6 +154,18 @@ func IsDiscoveryMethod(method string) bool {
 
 func ListMethodToCapability() map[string]string {
 	return listMethodToCapability
+}
+
+// ParseCapabilities returns the capabilities of an initialize or server/discover result.
+// A malformed result has no capabilities, so nothing is re-fetched for it.
+func ParseCapabilities(result *json.RawMessage) map[string]json.RawMessage {
+	var body struct {
+		Capabilities map[string]json.RawMessage `json:"capabilities"`
+	}
+	if result != nil {
+		json.Unmarshal(*result, &body)
+	}
+	return body.Capabilities
 }
 
 func MessageID(msg *Message) string {

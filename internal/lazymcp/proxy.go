@@ -18,7 +18,9 @@ type Proxy struct {
 	cache            *Cache
 	cachedData       map[string]json.RawMessage
 	discoverRequest  *Message
+	listenRequest    *Message
 	initializeParams *json.RawMessage
+	listParams       map[string]*json.RawMessage
 	cmd              *exec.Cmd
 	serverIn         io.WriteCloser
 	serverOut        *bufio.Scanner
@@ -31,6 +33,7 @@ func NewProxy(command []string, cache *Cache, stdin io.Reader, stdout io.Writer)
 		command:    command,
 		cache:      cache,
 		cachedData: cache.Load(),
+		listParams: make(map[string]*json.RawMessage),
 		stdin:      stdin,
 		stdout:     stdout,
 	}
@@ -65,6 +68,14 @@ func (p *Proxy) runCached(scanner *bufio.Scanner) error {
 				return p.goLive(msg, scanner)
 			}
 
+		case msg.Method == ListenMethod && msg.ID != nil:
+			p.listenRequest = msg
+			if ack, ok := MakeListenAck(json.RawMessage(*msg.ID), p.cachedData[ListenMethod]); ok {
+				p.writeStdout(ack)
+			} else {
+				return p.goLive(msg, scanner)
+			}
+
 		case msg.Method == "initialize":
 			p.initializeParams = msg.Params
 			if result, ok := p.cachedData["initialize"]; ok {
@@ -77,6 +88,7 @@ func (p *Proxy) runCached(scanner *bufio.Scanner) error {
 			// swallow
 
 		case IsDiscoveryMethod(msg.Method):
+			p.listParams[msg.Method] = msg.Params
 			if result, ok := p.cachedData[msg.Method]; ok {
 				p.writeStdout(MakeResponse(json.RawMessage(*msg.ID), result))
 			} else {
@@ -133,10 +145,23 @@ func (p *Proxy) runNoCache(scanner *bufio.Scanner) error {
 			}
 			p.saveCache(newCache)
 
+		case msg.Method == ListenMethod && msg.ID != nil:
+			p.listenRequest = msg
+			p.writeServer(SerializeMessage(msg))
+			ack, err := p.readListenAck(string(*msg.ID), true)
+			if err != nil {
+				return err
+			}
+			if ack != nil {
+				newCache[ListenMethod] = *ack
+			}
+			p.saveCache(newCache)
+
 		case msg.Method == "notifications/initialized":
 			p.writeServer(SerializeMessage(msg))
 
 		case IsDiscoveryMethod(msg.Method):
+			p.listParams[msg.Method] = msg.Params
 			resp, err := p.forwardRequest(msg)
 			if err != nil {
 				return err
@@ -172,6 +197,10 @@ func (p *Proxy) goLive(triggeringMsg *Message, scanner *bufio.Scanner) error {
 		newCache = make(map[string]json.RawMessage)
 	}
 
+	// A stateless server has no initialize, so its capabilities come from server/discover.
+	var capabilities map[string]json.RawMessage
+	stateless := false
+
 	if p.discoverRequest != nil {
 		discoverReq := MakeRequest("lazy-mcp-discover", DiscoverMethod, p.discoverRequest.Params)
 		p.writeServer(SerializeMessage(discoverReq))
@@ -180,6 +209,10 @@ func (p *Proxy) goLive(triggeringMsg *Message, scanner *bufio.Scanner) error {
 			return err
 		}
 		newCache[DiscoverMethod] = ResponseBody(discoverResp)
+		if p.initializeParams == nil && discoverResp.Result != nil {
+			stateless = true
+			capabilities = ParseCapabilities(discoverResp.Result)
+		}
 	}
 
 	if p.initializeParams != nil {
@@ -196,33 +229,47 @@ func (p *Proxy) goLive(triggeringMsg *Message, scanner *bufio.Scanner) error {
 		notif := &Message{JSONRPC: "2.0", Method: "notifications/initialized"}
 		p.writeServer(SerializeMessage(notif))
 
-		var initResult struct {
-			Capabilities map[string]json.RawMessage `json:"capabilities"`
-		}
-		if initResp.Result != nil {
-			json.Unmarshal(*initResp.Result, &initResult)
-		}
+		capabilities = ParseCapabilities(initResp.Result)
+	}
 
-		for method, capKey := range ListMethodToCapability() {
-			if _, ok := initResult.Capabilities[capKey]; ok {
-				reqID := fmt.Sprintf("lazy-mcp-%s", method)
-				req := MakeRequest(reqID, method, nil)
-				p.writeServer(SerializeMessage(req))
-				resp, err := p.readResponse(fmt.Sprintf("%q", reqID))
-				if err != nil {
-					return err
-				}
-				if resp.Result != nil {
-					newCache[method] = *resp.Result
-				}
-			}
+	for method, capKey := range ListMethodToCapability() {
+		if _, ok := capabilities[capKey]; !ok {
+			continue
+		}
+		// Stateless requests must carry the protocol version in _meta, as the client's own requests do.
+		params := p.listParams[method]
+		if params == nil && stateless {
+			params = p.discoverRequest.Params
+		}
+		reqID := fmt.Sprintf("lazy-mcp-%s", method)
+		req := MakeRequest(reqID, method, params)
+		p.writeServer(SerializeMessage(req))
+		resp, err := p.readResponse(fmt.Sprintf("%q", reqID))
+		if err != nil {
+			return err
+		}
+		if resp.Result != nil {
+			newCache[method] = *resp.Result
+		}
+	}
+
+	// The held listen stream reaches the server before the triggering message. If its ack
+	// was already served from cache, the server's ack is consumed instead of sent twice.
+	if p.listenRequest != nil {
+		p.writeServer(SerializeMessage(p.listenRequest))
+		ack, err := p.readListenAck(string(*p.listenRequest.ID), triggeringMsg == p.listenRequest)
+		if err != nil {
+			return err
+		}
+		if ack != nil {
+			newCache[ListenMethod] = *ack
 		}
 	}
 
 	p.saveCache(newCache)
 
-	// A triggering probe is answered from its replay above instead of being sent again.
-	answered := false
+	// A triggering listen request was sent above, and a triggering probe is answered from its replay.
+	answered := triggeringMsg == p.listenRequest
 	if triggeringMsg == p.discoverRequest {
 		var resp []byte
 		resp, answered = MakeResponseFromBody(json.RawMessage(*triggeringMsg.ID), newCache[DiscoverMethod])
@@ -287,6 +334,32 @@ func (p *Proxy) readResponse(requestID string) (*Message, error) {
 		}
 		p.writeStdout(p.serverOut.Bytes())
 		p.writeStdout([]byte("\n"))
+	}
+	if err := p.serverOut.Err(); err != nil {
+		return nil, fmt.Errorf("server closed: %w", err)
+	}
+	return nil, fmt.Errorf("server closed unexpectedly")
+}
+
+// readListenAck forwards server output until the server acknowledges the listen request,
+// returning the ack params, or rejects it with a response, returning nil.
+func (p *Proxy) readListenAck(requestID string, forwardAck bool) (*json.RawMessage, error) {
+	for p.serverOut.Scan() {
+		msg, err := ParseMessage(p.serverOut.Bytes())
+		if err != nil {
+			continue
+		}
+		isAck := msg.Method == ListenAckMethod && msg.Params != nil
+		if forwardAck || !isAck {
+			p.writeStdout(p.serverOut.Bytes())
+			p.writeStdout([]byte("\n"))
+		}
+		if isAck {
+			return msg.Params, nil
+		}
+		if msg.ID != nil && string(*msg.ID) == requestID {
+			return nil, nil
+		}
 	}
 	if err := p.serverOut.Err(); err != nil {
 		return nil, fmt.Errorf("server closed: %w", err)

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 type message struct {
@@ -20,6 +21,9 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
 	discoverCalls := 0
+	// A stateless server answers server/discover, accepts subscriptions/listen and
+	// rejects list requests that lack the protocol version in _meta.
+	stateless := os.Getenv("MOCK_STATELESS") == "1"
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -32,7 +36,36 @@ func main() {
 			continue
 		}
 
+		if stateless && strings.HasSuffix(msg.Method, "/list") && !hasProtocolVersion(msg.Params) {
+			respondError(msg.ID, -32022, "missing protocol version", nil)
+			continue
+		}
+
 		switch msg.Method {
+		case "server/discover":
+			discoverCalls++
+			if msg.ID == nil {
+				continue
+			}
+			if !stateless {
+				respondError(msg.ID, -32601, "Method server/discover not found",
+					map[string]any{"discoverCalls": discoverCalls})
+				continue
+			}
+			respond(msg.ID, map[string]any{
+				"supportedVersions": []string{"2026-07-28"},
+				"capabilities": map[string]any{
+					"tools":     map[string]any{"listChanged": true},
+					"resources": map[string]any{},
+					"prompts":   map[string]any{},
+				},
+				"discoverCalls": discoverCalls,
+			})
+		case "subscriptions/listen":
+			notify("notifications/subscriptions/acknowledged", map[string]any{
+				"_meta":         map[string]any{"io.modelcontextprotocol/subscriptionId": msg.ID},
+				"notifications": map[string]any{"toolsListChanged": true},
+			})
 		case "initialize":
 			respond(msg.ID, map[string]any{
 				"protocolVersion": "2024-11-05",
@@ -81,18 +114,29 @@ func main() {
 					map[string]any{"type": "text", "text": fmt.Sprintf("echo: %s", params.Arguments.Text)},
 				},
 			})
-		case "server/discover":
-			discoverCalls++
-			if msg.ID != nil {
-				respondError(msg.ID, -32601, "Method server/discover not found",
-					map[string]any{"discoverCalls": discoverCalls})
-			}
 		default:
 			if msg.ID != nil {
 				respondError(msg.ID, -32601, fmt.Sprintf("Method %s not found", msg.Method), nil)
 			}
 		}
 	}
+}
+
+func hasProtocolVersion(params *json.RawMessage) bool {
+	if params == nil {
+		return false
+	}
+	var body struct {
+		Meta map[string]any `json:"_meta"`
+	}
+	json.Unmarshal(*params, &body)
+	_, ok := body.Meta["io.modelcontextprotocol/protocolVersion"]
+	return ok
+}
+
+func notify(method string, params any) {
+	out, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+	fmt.Fprintf(os.Stdout, "%s\n", out)
 }
 
 func respondError(id *json.RawMessage, code int, message string, data any) {

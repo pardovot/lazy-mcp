@@ -1294,3 +1294,140 @@ func TestInProcess_GoLiveOnProbeWithoutParamsCachesIt(t *testing.T) {
 		t.Fatalf("cache should contain server/discover, got %v", cached)
 	}
 }
+
+// statelessSession mirrors what a client sends a 2026-07-28 server: a probe, a listen
+// stream, a second discover, then the lists, all carrying the protocol version in _meta.
+func statelessSession(idBase int) []string {
+	return []string{
+		request(fmt.Sprintf("probe-%d", idBase), "server/discover", discoverParams),
+		request(fmt.Sprintf("listen-%d", idBase), "subscriptions/listen", discoverParams),
+		request(idBase, "server/discover", discoverParams),
+		request(idBase+1, "tools/list", discoverParams),
+		request(idBase+2, "prompts/list", discoverParams),
+		request(idBase+3, "resources/list", discoverParams),
+	}
+}
+
+func listenAcks(responses []map[string]any) []map[string]any {
+	var acks []map[string]any
+	for _, resp := range responses {
+		if resp["method"] == ListenAckMethod {
+			acks = append(acks, resp)
+		}
+	}
+	return acks
+}
+
+func requireOneAck(t *testing.T, responses []map[string]any, wantSubscriptionID string) {
+	t.Helper()
+	acks := listenAcks(responses)
+	if len(acks) != 1 {
+		t.Fatalf("got %d listen acks, want 1: %v", len(acks), responses)
+	}
+	meta := acks[0]["params"].(map[string]any)["_meta"].(map[string]any)
+	if meta[subscriptionIDKey] != wantSubscriptionID {
+		t.Fatalf("ack subscription id: got %v, want %s", meta[subscriptionIDKey], wantSubscriptionID)
+	}
+}
+
+func requireEcho(t *testing.T, responses []map[string]any, id string, want string) {
+	t.Helper()
+	for _, resp := range responses {
+		if fmt.Sprintf("%v", resp["id"]) != id {
+			continue
+		}
+		text := resp["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"]
+		if text != want {
+			t.Fatalf("got %q, want %q", text, want)
+		}
+		return
+	}
+	t.Fatalf("response %s not found in %v", id, responses)
+}
+
+func requireCached(t *testing.T, serverBin string, keys ...string) {
+	t.Helper()
+	cached := NewCache([]string{serverBin}).Load()
+	for _, key := range keys {
+		if _, ok := cached[key]; !ok {
+			t.Fatalf("cache should contain %s, got %v", key, cached)
+		}
+	}
+}
+
+var statelessCacheKeys = []string{"server/discover", ListenMethod, "tools/list", "prompts/list", "resources/list"}
+
+func TestInProcess_StatelessServedFromCache(t *testing.T) {
+	t.Setenv("MOCK_STATELESS", "1")
+	serverBin := buildMockServer(t)
+	cacheDir := t.TempDir()
+
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, statelessSession(1)); err != nil {
+		t.Fatalf("first run error: %v", err)
+	}
+	requireCached(t, serverBin, statelessCacheKeys...)
+
+	if err := os.Remove(serverBin); err != nil {
+		t.Fatal(err)
+	}
+
+	responses, err := runProxyInProcess(t, serverBin, cacheDir, statelessSession(10))
+	if err != nil {
+		t.Fatalf("second run error: %v", err)
+	}
+	if len(responses) != 6 {
+		t.Fatalf("got %d messages, want 6: %v", len(responses), responses)
+	}
+	requireOneAck(t, responses, "listen-10")
+	for _, resp := range responses {
+		if resp["method"] == nil && resp["result"] == nil {
+			t.Fatalf("response should come from cache, got %v", resp)
+		}
+	}
+}
+
+func TestInProcess_StatelessGoLiveOnListenRefreshesCache(t *testing.T) {
+	t.Setenv("MOCK_STATELESS", "1")
+	serverBin := buildMockServer(t)
+	cacheDir := t.TempDir()
+
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, statelessSession(1)); err != nil {
+		t.Fatalf("first run error: %v", err)
+	}
+
+	// Keep only the probe, as when the first session ended before the lists were fetched.
+	cache := NewCache([]string{serverBin})
+	if err := cache.Save(map[string]json.RawMessage{DiscoverMethod: cache.Load()[DiscoverMethod]}); err != nil {
+		t.Fatal(err)
+	}
+
+	messages := append(statelessSession(10),
+		request(20, "tools/call", `{"name":"echo","arguments":{"text":"live"}}`))
+	responses, err := runProxyInProcess(t, serverBin, cacheDir, messages)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	requireOneAck(t, responses, "listen-10")
+	requireEcho(t, responses, "20", "echo: live")
+	requireCached(t, serverBin, statelessCacheKeys...)
+}
+
+func TestInProcess_StatelessGoLiveSendsOneAck(t *testing.T) {
+	t.Setenv("MOCK_STATELESS", "1")
+	serverBin := buildMockServer(t)
+	cacheDir := t.TempDir()
+
+	if _, err := runProxyInProcess(t, serverBin, cacheDir, statelessSession(1)); err != nil {
+		t.Fatalf("first run error: %v", err)
+	}
+
+	messages := append(statelessSession(10),
+		request(20, "tools/call", `{"name":"echo","arguments":{"text":"live"}}`))
+	responses, err := runProxyInProcess(t, serverBin, cacheDir, messages)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	requireOneAck(t, responses, "listen-10")
+	requireEcho(t, responses, "20", "echo: live")
+	requireCached(t, serverBin, statelessCacheKeys...)
+}
